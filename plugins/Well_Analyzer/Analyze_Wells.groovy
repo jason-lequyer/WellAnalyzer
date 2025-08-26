@@ -1,15 +1,15 @@
-/* WellAnalyzer.groovy – Scripted plugin (no compilation required)
- * Usage: Open an image, then Run from the Script Editor (Language: Groovy).
- * Optional: save to Fiji.app/plugins/Well Analyzer/WellAnalyzer.groovy, then Help ▸ Refresh Menus.
+/* Analyze_Wells.groovy — Scripted plugin (no compilation required)
+ * Menu: Plugins ▸ Well Analyzer ▸ Analyze Wells
+ * Step 1: Single slider to detect circular wells (best-fit circles, numbered).
+ * Step 2: Contents threshold with vivid magenta tint; inside non-selected is brightened.
  */
 
 import ij.IJ
 import ij.ImagePlus
 import ij.gui.*
 import ij.process.*
-import ij.plugin.*
 import ij.plugin.filter.*
-import ij.plugin.frame.*
+import ij.plugin.frame.RoiManager
 import ij.measure.*
 import ij.util.Tools
 
@@ -18,28 +18,20 @@ import javax.swing.JDialog
 import javax.swing.JPanel
 import javax.swing.JLabel
 import javax.swing.JSlider
-import javax.swing.JCheckBox
-import javax.swing.JSpinner
-import javax.swing.SpinnerNumberModel
 import javax.swing.JButton
-import javax.swing.BorderFactory
 import javax.swing.Box
 import javax.swing.BoxLayout
 
-// ===== AWT / Swing helpers =====
+// ===== AWT =====
 import java.awt.Font
 import java.awt.Dimension
 import java.awt.BorderLayout
 import java.awt.FlowLayout
-import java.awt.GridBagLayout
-import java.awt.GridBagConstraints
-import java.awt.Insets
 import java.awt.Color
 import java.awt.Rectangle
 import java.awt.RenderingHints
 import java.awt.Graphics
 import java.awt.Graphics2D
-import java.awt.event.ActionListener
 import javax.swing.event.ChangeListener
 
 // ===== Util =====
@@ -48,7 +40,7 @@ import java.util.ArrayList
 import java.util.Arrays
 import java.util.Comparator
 
-// ----------------- Small helpers -----------------
+// ----------------- Helpers -----------------
 double clamp(double v, double lo, double hi){ Math.max(lo, Math.min(hi, v)) }
 double otsuIntensity(ImageProcessor ip, double imgMin, double imgMax){
   int[] h = ip.getHistogram()
@@ -72,7 +64,7 @@ ImagePlus toGrayscaleIfNeeded(ImagePlus src){
   return dup
 }
 
-// -------------- Circle-of-best-fit (Kåsa) --------------
+// --------- Circle-of-best-fit (Kåsa) ----------
 double[] fitCircleKasa(float[] xs, float[] ys, int n){
   if (n < 3) return null
   double Sx=0, Sy=0, Sxx=0, Syy=0, Sxy=0, Sx3=0, Sy3=0, Sxxy=0, Sxyy=0
@@ -108,12 +100,8 @@ double[] fitCircleKasa(float[] xs, float[] ys, int n){
     A12*(A21*B3 - B2*A31) +
     B1*(A21*A32 - A22*A31)
 
-  double a = detA1/detA
-  double b = detA2/detA
-  double c = detA3/detA
-
-  double cx = -a/2.0
-  double cy = -b/2.0
+  double a = detA1/detA, b = detA2/detA, c = detA3/detA
+  double cx = -a/2.0, cy = -b/2.0
   double r2 = cx*cx + cy*cy - c
   if (!Double.isFinite(r2) || r2 <= 0) return null
   double r = Math.sqrt(r2)
@@ -137,7 +125,7 @@ Roi bestFitCircleRoi(Roi r, int imgW, int imgH){
   return new OvalRoi(cx - rad, cy - rad, 2*rad, 2*rad)
 }
 
-// ---------------- Overlays & masks ----------------
+// ------------- Overlays & masks -------------
 void overlayCirclesWithNumbers(ImagePlus imp, List<Roi> rois, Color circleColor, Color labelColor, Font font){
   Overlay ov = new Overlay()
   int idx = 1
@@ -169,8 +157,7 @@ void overlayCirclesWithNumbers(ImagePlus imp, List<Roi> rois, Color circleColor,
 }
 
 int[] labelMapFromRois(List<Roi> rois, int w, int h){
-  int[] labels = new int[w*h]
-  Arrays.fill(labels, 0)
+  int[] labels = new int[w*h]; Arrays.fill(labels, 0)
   for (int idx=0; idx<rois.size(); idx++){
     Roi r = rois.get(idx)
     Rectangle b = r.getBounds()
@@ -205,14 +192,6 @@ int[] labelMapFromRois(List<Roi> rois, int w, int h){
     }
   }
   return labels
-}
-
-FloatProcessor maskFloatInside(int w, int h, float[] src, boolean[] inside){
-  FloatProcessor out = new FloatProcessor(w, h, src.clone())
-  float[] p = (float[]) out.getPixels()
-  int n = p.length
-  for (int i=0; i<n; i++) if (!inside[i]) p[i]=0f
-  return out
 }
 
 int[] computeCropBounds(boolean[] inside, int w, int h, int pad){
@@ -258,7 +237,7 @@ List<Roi> shiftRois(List<Roi> rois, int dx, int dy){
   return out
 }
 
-// Build base grayscale RGB (from a wells-only FloatProcessor)
+// ---------- Base RGB from float (grayscale) ----------
 int[] buildBaseRGB(FloatProcessor srcFP, double imgMin, double imgMax){
   int w = srcFP.getWidth(), h = srcFP.getHeight(), n = w*h
   float[] src = (float[]) srcFP.getPixels()
@@ -270,19 +249,8 @@ int[] buildBaseRGB(FloatProcessor srcFP, double imgMin, double imgMax){
   }
   return base
 }
-ByteProcessor buildSelectedMask(FloatProcessor srcFP, boolean[] insideMask, double thr){
-  int w = srcFP.getWidth(), h = srcFP.getHeight(), n = w*h
-  float[] src = (float[]) srcFP.getPixels()
-  ByteProcessor bp = new ByteProcessor(w, h)
-  byte[] dst = (byte[]) bp.getPixels()
-  for (int i=0; i<n; i++) dst[i] = (byte)((insideMask[i] && src[i]>=thr) ? 255 : 0)
-  return bp
-}
 
-// --- POP TINT overlay (revised):
-// Selected pixels: magenta tint + slight dim of underlying gray.
-// Non-selected INSIDE wells: brightened grayscale for contrast.
-// Outside wells: unchanged (already black in the wells-only image).
+// ---------- “Pop” tint overlay (selected tinted, non-selected brightened) ----------
 void applyPopTintOverlay(ImagePlus targetImp, int[] baseRGB, FloatProcessor srcFP,
                          boolean[] insideMask, double thr,
                          int tintR, int tintG, int tintB, double tintAlpha,
@@ -300,20 +268,15 @@ void applyPopTintOverlay(ImagePlus targetImp, int[] baseRGB, FloatProcessor srcF
     int g = px & 0xff
     if (insideMask[i]){
       if (src[i] >= thr){
-        // Dim the base gray slightly under the tint
         int gDim = (int)Math.round(g * dimUnderTintFactor)
         int r2 = (int)Math.round(ia*gDim + tintAlpha*rT)
         int g2 = (int)Math.round(ia*gDim + tintAlpha*gT)
         int b2 = (int)Math.round(ia*gDim + tintAlpha*bT)
         out[i] = (0xFF<<24) | ((r2&0xff)<<16) | ((g2&0xff)<<8) | (b2&0xff)
       } else {
-        // Brighten the non-selected pixels inside wells
         int gB = (int)Math.round(Math.min(255, g * brightenFactor))
         out[i] = (0xFF<<24) | ((gB&0xff)<<16) | ((gB&0xff)<<8) | (gB&0xff)
       }
-    } else {
-      // outside wells: keep as-is (black)
-      out[i] = px
     }
   }
 
@@ -360,9 +323,6 @@ class HistPanel extends JPanel {
     int maxC = 1; for (int v: hist) if (v>maxC) maxC=v
 
     int x0=32, y0=H-20, ww=W-42, hh=H-30
-    g2.setColor(new Color(220,220,220))
-    g2.drawLine(x0, y0, x0+ww, y0)
-    g2.drawLine(x0, y0-hh, x0, y0)
     g2.setColor(new Color(90,90,90))
     int px=-1, py=-1
     for (int i=0; i<bins; i++){
@@ -372,15 +332,15 @@ class HistPanel extends JPanel {
       if (px>=0) g2.drawLine(px,py,x,y)
       px=x; py=y
     }
+    // Red threshold line
     double tf = (thr - imgMin) / Math.max(1e-9, (imgMax - imgMin))
     if (tf < 0) tf = 0; else if (tf > 1) tf = 1
     int xT = x0 + (int)Math.round(tf*(ww-1))
-    g2.setColor(Color.RED)
-    g2.drawLine(xT, y0-hh, xT, y0)
+    g2.setColor(Color.RED); g2.drawLine(xT, y0-hh, xT, y0)
   }
 }
 
-// Masked histogram of wells-only FP (bins=256)
+// ---------- Masked histogram ----------
 int[] maskedHistogram(FloatProcessor fp, boolean[] inside, double lo, double hi, int bins){
   int n = fp.getWidth()*fp.getHeight()
   float[] p = (float[]) fp.getPixels()
@@ -396,10 +356,10 @@ int[] maskedHistogram(FloatProcessor fp, boolean[] inside, double lo, double hi,
   return h
 }
 
-// --------------- Core detection ----------------
+// ---------- Detection (UI-hidden params) ----------
 List<Roi> detectWells(FloatProcessor srcFP, double thr, boolean invert,
                       double minArea, double maxArea,
-                      int keepTopN, double minSpacingPx, double borderMarginPx,
+                      int keepTopN, double borderMarginPx,
                       boolean doMorphClose){
   int w = srcFP.getWidth(), h = srcFP.getHeight(), nPix = w*h
   ByteProcessor bin = new ByteProcessor(w, h)
@@ -420,7 +380,6 @@ List<Roi> detectWells(FloatProcessor srcFP, double thr, boolean invert,
   ResultsTable rt = new ResultsTable()
   RoiManager rm = RoiManager.getInstance2()
   if (rm==null) rm = new RoiManager()
-
   int options = ParticleAnalyzer.ADD_TO_MANAGER
   int meas = Measurements.AREA | Measurements.CENTROID | Measurements.ELLIPSE
   ParticleAnalyzer pa = new ParticleAnalyzer(options, meas, rt,
@@ -443,20 +402,21 @@ List<Roi> detectWells(FloatProcessor srcFP, double thr, boolean invert,
     areas[i]=s.area; cx[i]=s.xCentroid; cy[i]=s.yCentroid
   }
 
-  boolean[] ok = new boolean[rois.length]
-  int nOK = 0
+  // Border filter
+  boolean[] ok = new boolean[rois.length]; int nOK = 0
   for (int i=0; i<rois.length; i++){
     boolean inside = (cx[i] >= borderMarginPx) && (cx[i] <= w - borderMarginPx) &&
                      (cy[i] >= borderMarginPx) && (cy[i] <= h - borderMarginPx)
-    ok[i] = inside
-    if (inside) nOK++
+    ok[i] = inside; if (inside) nOK++
   }
   if (nOK == 0) return []
 
+  // Rank by area (largest first)
   Integer[] idx = new Integer[nOK]; int cnt=0
   for (int i=0; i<rois.length; i++) if (ok[i]) idx[cnt++] = i
   Arrays.sort(idx, { Integer i1, Integer i2 -> Double.compare(areas[i2], areas[i1]) } as Comparator)
 
+  // Gentle dedup by center distance based on median area
   double[] okAreas = new double[nOK]; int j=0
   for (int i=0; i<rois.length; i++) if (ok[i]) okAreas[j++] = areas[i]
   double medArea = median(okAreas)
@@ -481,13 +441,12 @@ List<Roi> detectWells(FloatProcessor srcFP, double thr, boolean invert,
   return kept
 }
 
-// ---------------- Measurements ----------------
+// ---------- Measurements ----------
 void computeAndShowFinalResults(ImagePlus workImp, int[] labelMap, int nWells, double thr2){
   FloatProcessor src = (FloatProcessor) workImp.getProcessor()
   float[] p = (float[]) src.getPixels(); int nPix = p.length
   long[] countAll = new long[nWells+1], countSel = new long[nWells+1]
   double[] sumAll = new double[nWells+1], sumSel = new double[nWells+1]
-
   for (int i=0; i<nPix; i++){
     int label = (labelMap==null)?0:labelMap[i]
     if (label==0) continue
@@ -495,7 +454,6 @@ void computeAndShowFinalResults(ImagePlus workImp, int[] labelMap, int nWells, d
     countAll[label]++; sumAll[label]+=v
     if (v>=thr2){ countSel[label]++; sumSel[label]+=v }
   }
-
   ResultsTable rt = new ResultsTable()
   for (int w=1; w<=nWells; w++){
     double areaPct = (countAll[w]==0)?0:(100.0*countSel[w]/(double)countAll[w])
@@ -526,42 +484,38 @@ FloatProcessor fpRaw = (FloatProcessor) workImp.getProcessor().duplicate()
 FloatProcessor fpDenoised = (FloatProcessor) fpRaw.duplicate()
 new RankFilters().rank(fpDenoised, 2.0, RankFilters.MEDIAN)
 
-// Slider mapping
+// Slider mapping (Step 1 uses full-image range)
 def toSlider   = { double t -> (int)Math.round(1000.0 * ((t - imgMin) / Math.max(1e-9, (imgMax - imgMin)))) }
 def fromSlider = { int sv     -> imgMin + (sv/1000.0) * (imgMax - imgMin) }
 
-// ==== STEP 1: Single slider + numbered red circles ====
+// ====== STEP 1: Single slider (no other options) ======
 class Step1Config {
   double thr
-  double minArea
-  double maxArea
-  int    keepTopN
-  double borderMargin
-  int    cropPad
-  boolean invert
-  boolean morphClose
-  boolean useMedian
-  boolean circleFit
-  boolean accepted = false
+  // internal defaults (not shown in UI)
+  double minArea     = 10000    // ≈ 100x100 px min area
+  double maxArea     = 0        // 0 = ∞
+  int    keepTopN    = 0        // 0 = keep all detected wells
+  double borderMargin= 10
+  int    cropPad     = 8
+  boolean morphClose = true
+  boolean useMedian  = true
+  boolean circleFit  = true
+  boolean accepted   = false
 }
 Step1Config cfg1 = new Step1Config()
-cfg1.thr         = otsuIntensity(workImp.getProcessor(), imgMin, imgMax)
-cfg1.minArea     = 2500
-cfg1.maxArea     = 0
-cfg1.keepTopN    = 6
-cfg1.borderMargin= 10
-cfg1.cropPad     = 8
-cfg1.invert      = false
-cfg1.morphClose  = true
-cfg1.useMedian   = true
-cfg1.circleFit   = true
+cfg1.thr = otsuIntensity(workImp.getProcessor(), imgMin, imgMax)
 
-JDialog d1 = new JDialog((java.awt.Frame)null, "Well Analyzer – Step 1 (Detect Wells)", true)
+JDialog d1 = new JDialog((java.awt.Frame)null, "Analyze Wells – Step 1", true)
 d1.setLayout(new BorderLayout(10,10))
-JPanel top = new JPanel(); top.setLayout(new BoxLayout(top, BoxLayout.Y_AXIS))
-JLabel title = new JLabel("Detect wells – numbered red circles (live)")
-title.setFont(new Font("SansSerif", Font.BOLD, 16)); title.setAlignmentX(JLabel.CENTER_ALIGNMENT)
-top.add(title); top.add(Box.createVerticalStrut(6))
+
+JPanel top = new JPanel()
+top.setLayout(new BoxLayout(top, BoxLayout.Y_AXIS))
+JLabel title = new JLabel("Adjust the Well Threshold")
+title.setFont(new Font("SansSerif", Font.BOLD, 16))
+title.setAlignmentX(JLabel.CENTER_ALIGNMENT)
+top.add(title)
+top.add(Box.createVerticalStrut(6))
+
 JPanel thrPanel = new JPanel(new BorderLayout(6,6))
 thrPanel.setAlignmentX(JPanel.CENTER_ALIGNMENT)
 JLabel thrLabel = new JLabel(String.format("Well threshold: %.2f", cfg1.thr), JLabel.CENTER)
@@ -570,83 +524,73 @@ JSlider thrSlider = new JSlider(0,1000, toSlider(cfg1.thr))
 thrSlider.setMajorTickSpacing(250); thrSlider.setMinorTickSpacing(50)
 thrSlider.setPaintTicks(true); thrSlider.setPaintLabels(true)
 thrSlider.setPreferredSize(new Dimension(520, 54))
-thrPanel.add(thrLabel, BorderLayout.NORTH); thrPanel.add(thrSlider, BorderLayout.CENTER)
+thrPanel.add(thrLabel, BorderLayout.NORTH)
+thrPanel.add(thrSlider, BorderLayout.CENTER)
 top.add(thrPanel)
 
-// Advanced
-JPanel adv = new JPanel(new GridBagLayout())
-adv.setBorder(BorderFactory.createTitledBorder("Advanced"))
-GridBagConstraints ga = new GridBagConstraints()
-ga.insets=new Insets(3,3,3,3); ga.fill=GridBagConstraints.HORIZONTAL; ga.weightx=1.0
-JSpinner spMinArea = new JSpinner(new SpinnerNumberModel(cfg1.minArea as Double, 0.0d as Double, 1.0e12d as Double, 100.0d as Double))
-JSpinner spMaxArea = new JSpinner(new SpinnerNumberModel(cfg1.maxArea as Double, 0.0d as Double, 1.0e12d as Double, 1000.0d as Double))
-JSpinner spKeepN   = new JSpinner(new SpinnerNumberModel(Integer.valueOf(cfg1.keepTopN), Integer.valueOf(0), Integer.valueOf(9999), Integer.valueOf(1)))
-JSpinner spBorder  = new JSpinner(new SpinnerNumberModel(cfg1.borderMargin as Double, 0.0d as Double, 1.0e6d as Double, 1.0d as Double))
-JSpinner spCropPad = new JSpinner(new SpinnerNumberModel(Integer.valueOf(cfg1.cropPad), Integer.valueOf(0), Integer.valueOf(200), Integer.valueOf(1)))
-JCheckBox cbInvert = new JCheckBox("Wells are dark on bright background", cfg1.invert)
-JCheckBox cbClose  = new JCheckBox("Morphological close (dilate+erode)", cfg1.morphClose)
-JCheckBox cbMedian = new JCheckBox("Use median denoise (precomputed)", cfg1.useMedian)
-JCheckBox cbCircle = new JCheckBox("Use circle-of-best-fit masks", cfg1.circleFit)
-String[] labels = ["Min area (px²)", "Max area (px², 0=∞)", "Keep top N wells (0=all)", "Border margin (px)", "Crop border (px)"]
-def comps = [spMinArea, spMaxArea, spKeepN, spBorder, spCropPad]
-for (int i=0; i<labels.length; i++){ ga.gridx=0; ga.gridy=i; adv.add(new JLabel(labels[i]), ga); ga.gridx=1; adv.add(comps[i], ga) }
-ga.gridx=0; ga.gridy=labels.length; ga.gridwidth=2; adv.add(cbInvert, ga)
-ga.gridy++; adv.add(cbClose, ga)
-ga.gridy++; adv.add(cbMedian, ga)
-ga.gridy++; adv.add(cbCircle, ga)
-top.add(Box.createVerticalStrut(8)); top.add(adv)
 d1.add(top, BorderLayout.CENTER)
-JPanel buttons = new JPanel(new FlowLayout(FlowLayout.RIGHT)); JButton ok1 = new JButton("OK"); JButton cancel1 = new JButton("Cancel")
-buttons.add(cancel1); buttons.add(ok1); d1.add(buttons, BorderLayout.SOUTH)
-d1.pack(); d1.setLocationRelativeTo(null)
+JPanel buttons = new JPanel(new FlowLayout(FlowLayout.RIGHT))
+JButton cancel1 = new JButton("Cancel")
+JButton ok1 = new JButton("OK")
+buttons.add(cancel1); buttons.add(ok1)
+d1.add(buttons, BorderLayout.SOUTH)
+d1.pack()
+d1.setLocationRelativeTo(null)
 
-// Live preview
+// Live preview with automatic polarity (bright vs dark wells)
 long lastUpdate = 0L
 final long MIN_INTERVAL_MS = 60L
 List<Roi> wellRois = []
 Font labelFont = new Font("SansSerif", Font.BOLD, 13)
+
+def detectAutoPolarity = { FloatProcessor srcFP, double t ->
+  List<Roi> a = detectWells(srcFP, t, false, cfg1.minArea, cfg1.maxArea, cfg1.keepTopN, cfg1.borderMargin, cfg1.morphClose)
+  List<Roi> b = detectWells(srcFP, t, true,  cfg1.minArea, cfg1.maxArea, cfg1.keepTopN, cfg1.borderMargin, cfg1.morphClose)
+  return (b.size() > a.size()) ? b : a
+}
+
 def doDetectAndPreview = {
   long now = System.currentTimeMillis()
   if (now - lastUpdate < MIN_INTERVAL_MS) return
   lastUpdate = now
-  cfg1.minArea     = ((Number)spMinArea.getValue()).doubleValue()
-  cfg1.maxArea     = ((Number)spMaxArea.getValue()).doubleValue()
-  cfg1.keepTopN    = ((Number)spKeepN.getValue()).intValue()
-  cfg1.borderMargin= ((Number)spBorder.getValue()).doubleValue()
-  cfg1.cropPad     = ((Number)spCropPad.getValue()).intValue()
-  cfg1.invert      = cbInvert.isSelected()
-  cfg1.morphClose  = cbClose.isSelected()
-  cfg1.useMedian   = cbMedian.isSelected()
-  cfg1.circleFit   = cbCircle.isSelected()
 
   FloatProcessor srcFP = cfg1.useMedian ? fpDenoised : fpRaw
-  List<Roi> rois = detectWells(srcFP, cfg1.thr, cfg1.invert,
-      cfg1.minArea, cfg1.maxArea,
-      cfg1.keepTopN, 0, cfg1.borderMargin,
-      cfg1.morphClose)
+  List<Roi> rois = detectAutoPolarity(srcFP, cfg1.thr)
 
   List<Roi> circles = new ArrayList<>()
-  if (cfg1.circleFit){ for (Roi r : rois) circles.add(bestFitCircleRoi(r, W, H)) } else { circles = rois }
-  try { RoiManager rm = RoiManager.getInstance2(); if (rm!=null){ rm.runCommand("Show None"); rm.reset(); rm.setVisible(false) } } catch(Throwable ignore) {}
+  if (cfg1.circleFit){
+    for (Roi r : rois) circles.add(bestFitCircleRoi(r, W, H))
+  } else circles = rois
+
   overlayCirclesWithNumbers(imp, circles, Color.red, Color.white, labelFont)
   wellRois = circles
 }
-thrSlider.addChangeListener({ e -> cfg1.thr = fromSlider(thrSlider.getValue()); thrLabel.setText(String.format("Well threshold: %.2f", cfg1.thr)); doDetectAndPreview() } as ChangeListener)
+
+thrSlider.addChangeListener({ e ->
+  cfg1.thr = fromSlider(thrSlider.getValue())
+  thrLabel.setText(String.format("Well threshold: %.2f", cfg1.thr))
+  doDetectAndPreview()
+} as ChangeListener)
+
 thrLabel.setText(String.format("Well threshold: %.2f", cfg1.thr))
 doDetectAndPreview()
-ok1.addActionListener({ e -> cfg1.accepted = true; d1.dispose() } as ActionListener)
-cancel1.addActionListener({ e -> cfg1.accepted = false; d1.dispose() } as ActionListener)
+
+ok1.addActionListener({ e -> cfg1.accepted = true; d1.dispose() } as java.awt.event.ActionListener)
+cancel1.addActionListener({ e -> cfg1.accepted = false; d1.dispose() } as java.awt.event.ActionListener)
+
 d1.setVisible(true)
 if (!cfg1.accepted){ imp.setOverlay(null); return }
-if (wellRois.isEmpty()){ IJ.error("No wells detected. Try lowering Min area, or enabling 'Wells are dark'."); imp.setOverlay(null); return }
+if (wellRois.isEmpty()){ IJ.error("No wells detected at this threshold. Try a different value."); imp.setOverlay(null); return }
 
-// ==== Build mask & wells-only cropped image ====
+// ===== Build mask & wells-only cropped image =====
 int[] labelMap = labelMapFromRois(wellRois, W, H)
-boolean[] insideMask = new boolean[W*H]; for (int i=0; i<insideMask.length; i++) insideMask[i] = (labelMap[i] != 0)
+boolean[] insideMask = new boolean[W*H]
+for (int i=0; i<insideMask.length; i++) insideMask[i] = (labelMap[i] != 0)
+
 int[] cb = computeCropBounds(insideMask, W, H, cfg1.cropPad)
 int x0 = cb[0], y0 = cb[1], CW = cb[2], CH = cb[3]
 
-// Copy only inside pixels into crop
+// copy only inside pixels into crop
 float[] srcAll = (float[])((FloatProcessor)workImp.getProcessor()).getPixels()
 float[] dstCrop = new float[CW*CH]
 for (int y=0; y<CH; y++){
@@ -662,33 +606,41 @@ FloatProcessor wellsFP = new FloatProcessor(CW, CH, dstCrop)
 ImagePlus wellsImp = new ImagePlus(imp.getTitle()+" [wells-only,cropped]", wellsFP)
 wellsImp.show()
 
-// Shift circles and number them on the cropped image
+// numbered circles on the cropped image
 List<Roi> shifted = shiftRois(wellRois, x0, y0)
 overlayCirclesWithNumbers(wellsImp, shifted, Color.red, Color.white, labelFont)
 
-// --- Zoom to 100% exactly ---
+// zoom to exactly 100%
 try { IJ.run(wellsImp, "Original Scale", "") } catch(Throwable ignore) {}
-// (Optional) make the window a bit larger without changing zoom
+// enlarge window (visual comfort, does not change zoom)
 try {
   def win = wellsImp.getWindow()
   if (win!=null) win.setSize(new Dimension(Math.max(720, win.getWidth()+160), Math.max(560, win.getHeight()+120)))
 } catch(Throwable ignore) {}
 imp.setOverlay(null); imp.updateAndDraw()
 
-// ==== STEP 2: Tint-only (pop) + Histogram + Live stats ====
+// ===== STEP 2: Tint-only + histogram + live stats =====
 class Step2Config { double thr; boolean accepted=false }
 Step2Config cfg2 = new Step2Config()
-cfg2.thr = otsuIntensity(wellsImp.getProcessor(), imgMin, imgMax)
+
+// Use wells-only stats for Step 2 mapping
+def st2 = wellsImp.getProcessor().getStatistics()
+double wellsMin = st2.min, wellsMax = st2.max
+if (!Double.isFinite(wellsMin) || !Double.isFinite(wellsMax) || wellsMin==wellsMax){ wellsMin=imgMin; wellsMax=imgMax }
+def toSlider2   = { double t -> (int)Math.round(1000.0 * ((t - wellsMin) / Math.max(1e-9, (wellsMax - wellsMin)))) }
+def fromSlider2 = { int sv     -> wellsMin + (sv/1000.0) * (wellsMax - wellsMin) }
+cfg2.thr = otsuIntensity(wellsImp.getProcessor(), wellsMin, wellsMax)
 
 boolean[] insideCrop = cropMask(insideMask, W, H, x0, y0, CW, CH)
-int[] baseRGB  = buildBaseRGB(wellsFP, imgMin, imgMax)
-int[] hist = maskedHistogram(wellsFP, insideCrop, imgMin, imgMax, 256)
-HistPanel histPanel = new HistPanel(hist, cfg2.thr, imgMin, imgMax)
+int[] baseRGB  = buildBaseRGB(wellsFP, wellsMin, wellsMax)
+int[] hist = maskedHistogram(wellsFP, insideCrop, wellsMin, wellsMax, 256)
+HistPanel histPanel = new HistPanel(hist, cfg2.thr, wellsMin, wellsMax)
 
-JDialog d2 = new JDialog((java.awt.Frame)null, "Well Analyzer – Step 2 (Contents)", true)
+// Step 2 dialog
+JDialog d2 = new JDialog((java.awt.Frame)null, "Analyze Wells – Step 2", true)
 d2.setLayout(new BorderLayout(10,10))
 JPanel t2 = new JPanel(); t2.setLayout(new BoxLayout(t2, BoxLayout.Y_AXIS))
-JLabel title2 = new JLabel("Contents threshold – vivid tint inside circles (outside is black)")
+JLabel title2 = new JLabel("Contents threshold (vivid tint inside circles)")
 title2.setFont(new Font("SansSerif", Font.BOLD, 16)); title2.setAlignmentX(JLabel.CENTER_ALIGNMENT)
 t2.add(title2); t2.add(Box.createVerticalStrut(6))
 
@@ -696,14 +648,14 @@ JPanel thr2Panel = new JPanel(new BorderLayout(6,6))
 thr2Panel.setAlignmentX(JPanel.CENTER_ALIGNMENT)
 JLabel thr2Label = new JLabel(String.format("Content threshold: %.2f", cfg2.thr), JLabel.CENTER)
 thr2Label.setFont(new Font("SansSerif", Font.PLAIN, 14))
-JSlider thr2Slider = new JSlider(0, 1000, toSlider(cfg2.thr))
+JSlider thr2Slider = new JSlider(0, 1000, toSlider2(cfg2.thr))
 thr2Slider.setMajorTickSpacing(250); thr2Slider.setMinorTickSpacing(50)
 thr2Slider.setPaintTicks(true); thr2Slider.setPaintLabels(true)
 thr2Slider.setPreferredSize(new Dimension(520, 54))
 thr2Panel.add(thr2Label, BorderLayout.NORTH); thr2Panel.add(thr2Slider, BorderLayout.CENTER)
 t2.add(thr2Panel)
 
-// Histogram + live stats
+// histogram + live stats
 JPanel statsPanel = new JPanel(new FlowLayout(FlowLayout.CENTER, 12, 4))
 JLabel lblArea = new JLabel("Area selected: -- %")
 JLabel lblInt  = new JLabel("Intensity selected: -- %")
@@ -735,11 +687,11 @@ def updateLiveStats = { ->
   lblInt.setText(String.format("Intensity selected: %.2f%%", intPct))
 }
 
-// Visualization updater (tint only, with strong emphasis)
-final int TINT_R = 255, TINT_G = 64, TINT_B = 160    // vivid magenta
-final double TINT_ALPHA = 0.60                        // tint opacity
-final double DIM_UNDER_TINT = 0.70                    // dim grayscale under tint
-final double BRIGHTEN_FACTOR = 1.25                   // brighten non-selected pixels inside wells
+// Visualization constants
+final int TINT_R = 255, TINT_G = 64, TINT_B = 160   // vivid magenta
+final double TINT_ALPHA = 0.60                      // opacity of tint
+final double DIM_UNDER_TINT = 0.70                  // dim grayscale under tinted pixels
+final double BRIGHTEN_FACTOR = 1.30                 // brighten non-selected inside wells
 
 def refreshPreview = { ->
   histPanel.setThr(cfg2.thr)
@@ -749,24 +701,22 @@ def refreshPreview = { ->
                       shifted, labelFont)
   updateLiveStats()
 }
-
-// initial apply
 refreshPreview()
 
-// Throttled updates
+// throttled slider updates
 long last2 = 0L
 final long MIN2 = 50L
 thr2Slider.addChangeListener({ e ->
   long now = System.currentTimeMillis()
   if (now - last2 < MIN2) return
   last2 = now
-  cfg2.thr = fromSlider(thr2Slider.getValue())
+  cfg2.thr = fromSlider2(thr2Slider.getValue())
   thr2Label.setText(String.format("Content threshold: %.2f", cfg2.thr))
   refreshPreview()
 } as ChangeListener)
 
-ok2.addActionListener({ e -> cfg2.accepted = true; d2.dispose() } as ActionListener)
-cancel2.addActionListener({ e -> cfg2.accepted = false; d2.dispose() } as ActionListener)
+ok2.addActionListener({ e -> cfg2.accepted = true; d2.dispose() } as java.awt.event.ActionListener)
+cancel2.addActionListener({ e -> cfg2.accepted = false; d2.dispose() } as java.awt.event.ActionListener)
 
 d2.setVisible(true)
 if (!cfg2.accepted){
