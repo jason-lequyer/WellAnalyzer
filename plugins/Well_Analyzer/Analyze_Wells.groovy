@@ -1,7 +1,8 @@
 /* Analyze_Wells.groovy — Scripted plugin (no compilation required)
  * Menu: Plugins ▸ Well Analyzer ▸ Analyze Wells
- * Step 1: Single slider to detect circular wells (best-fit circles, numbered).
- * Step 2: Contents threshold with vivid magenta tint; inside non-selected is brightened.
+ * Step 1 (fast preview): Single slider; draws circles from centroid+area (no RoiManager).
+ * Step 1 (on OK): Recompute once with RoiManager + circle-of-best-fit.
+ * Step 2: Contents threshold with vivid magenta tint; non-selected inside wells is brightened.
  */
 
 import ij.IJ
@@ -33,6 +34,7 @@ import java.awt.RenderingHints
 import java.awt.Graphics
 import java.awt.Graphics2D
 import javax.swing.event.ChangeListener
+import javax.swing.JSlider  // for getValueIsAdjusting()
 
 // ===== Util =====
 import java.util.List
@@ -356,7 +358,45 @@ int[] maskedHistogram(FloatProcessor fp, boolean[] inside, double lo, double hi,
   return h
 }
 
-// ---------- Detection (UI-hidden params) ----------
+// ---------- FAST detection for Step‑1 preview (no RoiManager) ----------
+List<Roi> detectWellsFastByArea(FloatProcessor srcFP, double thr, boolean invert,
+                                double minArea, double maxArea, double borderMarginPx,
+                                boolean doMorphClose){
+  int w = srcFP.getWidth(), h = srcFP.getHeight(), nPix = w*h
+  ByteProcessor bin = new ByteProcessor(w, h)
+  float[] src = (float[]) srcFP.getPixels()
+  byte[] dst = (byte[]) bin.getPixels()
+  if (!invert) for (int i=0; i<nPix; i++) dst[i] = (byte)((src[i] >= thr) ? 255 : 0)
+  else        for (int i=0; i<nPix; i++) dst[i] = (byte)((src[i] <= thr) ? 255 : 0)
+
+  if (doMorphClose){
+    BinaryProcessor bp = new BinaryProcessor(bin)
+    bp.dilate(); bp.erode()
+    bin = (ByteProcessor) bp
+  }
+
+  ResultsTable rt = new ResultsTable()
+  int meas = Measurements.AREA | Measurements.CENTROID | Measurements.ELLIPSE
+  ParticleAnalyzer pa = new ParticleAnalyzer(ParticleAnalyzer.SHOW_NONE, meas, rt,
+      Math.max(0, minArea), (maxArea>0 ? maxArea : Double.POSITIVE_INFINITY), 0.0, 1.0)
+  pa.setHideOutputImage(true)
+  pa.analyze(new ImagePlus("bin", bin))
+
+  int n = rt.size()
+  List<Roi> circles = new ArrayList<>()
+  for (int i=0; i<n; i++){
+    double area = rt.getValue("Area", i)
+    double cx   = rt.getValue("X", i)   // Centroid X
+    double cy   = rt.getValue("Y", i)   // Centroid Y
+    if (!Double.isFinite(area) || area <= 0) continue
+    if (cx < borderMarginPx || cx > w - borderMarginPx || cy < borderMarginPx || cy > h - borderMarginPx) continue
+    double r = Math.sqrt(area / Math.PI)
+    circles.add(new OvalRoi(cx - r, cy - r, 2*r, 2*r))
+  }
+  return circles
+}
+
+// ---------- Accurate detection (uses RoiManager) ----------
 List<Roi> detectWells(FloatProcessor srcFP, double thr, boolean invert,
                       double minArea, double maxArea,
                       int keepTopN, double borderMarginPx,
@@ -488,10 +528,10 @@ new RankFilters().rank(fpDenoised, 2.0, RankFilters.MEDIAN)
 def toSlider   = { double t -> (int)Math.round(1000.0 * ((t - imgMin) / Math.max(1e-9, (imgMax - imgMin)))) }
 def fromSlider = { int sv     -> imgMin + (sv/1000.0) * (imgMax - imgMin) }
 
-// ====== STEP 1: Single slider (no other options) ======
+// ====== STEP 1: Single slider (fast preview, no RoiManager) ======
 class Step1Config {
   double thr
-  // internal defaults (not shown in UI)
+  // hidden defaults (kept simple for speed)
   double minArea     = 10000    // ≈ 100x100 px min area
   double maxArea     = 0        // 0 = ∞
   int    keepTopN    = 0        // 0 = keep all detected wells
@@ -537,17 +577,24 @@ d1.add(buttons, BorderLayout.SOUTH)
 d1.pack()
 d1.setLocationRelativeTo(null)
 
-// Live preview with automatic polarity (bright vs dark wells)
-long lastUpdate = 0L
-final long MIN_INTERVAL_MS = 60L
-List<Roi> wellRois = []
-Font labelFont = new Font("SansSerif", Font.BOLD, 13)
+// Fast auto-polarity (bright vs dark) for preview
+def detectAutoPolarityFast = { FloatProcessor srcFP, double t ->
+  List<Roi> a = detectWellsFastByArea(srcFP, t, false, cfg1.minArea, cfg1.maxArea, cfg1.borderMargin, cfg1.morphClose)
+  List<Roi> b = detectWellsFastByArea(srcFP, t, true,  cfg1.minArea, cfg1.maxArea, cfg1.borderMargin, cfg1.morphClose)
+  (b.size() > a.size()) ? b : a
+}
 
-def detectAutoPolarity = { FloatProcessor srcFP, double t ->
+// Accurate auto-polarity for final pass
+def detectAutoPolarityAccurate = { FloatProcessor srcFP, double t ->
   List<Roi> a = detectWells(srcFP, t, false, cfg1.minArea, cfg1.maxArea, cfg1.keepTopN, cfg1.borderMargin, cfg1.morphClose)
   List<Roi> b = detectWells(srcFP, t, true,  cfg1.minArea, cfg1.maxArea, cfg1.keepTopN, cfg1.borderMargin, cfg1.morphClose)
-  return (b.size() > a.size()) ? b : a
+  (b.size() > a.size()) ? b : a
 }
+
+long lastUpdate = 0L
+final long MIN_INTERVAL_MS = 80L
+List<Roi> wellRois = []
+Font labelFont = new Font("SansSerif", Font.BOLD, 13)
 
 def doDetectAndPreview = {
   long now = System.currentTimeMillis()
@@ -555,12 +602,9 @@ def doDetectAndPreview = {
   lastUpdate = now
 
   FloatProcessor srcFP = cfg1.useMedian ? fpDenoised : fpRaw
-  List<Roi> rois = detectAutoPolarity(srcFP, cfg1.thr)
 
-  List<Roi> circles = new ArrayList<>()
-  if (cfg1.circleFit){
-    for (Roi r : rois) circles.add(bestFitCircleRoi(r, W, H))
-  } else circles = rois
+  // compute fast preview (no RoiManager)
+  List<Roi> circles = detectAutoPolarityFast(srcFP, cfg1.thr)
 
   overlayCirclesWithNumbers(imp, circles, Color.red, Color.white, labelFont)
   wellRois = circles
@@ -569,7 +613,9 @@ def doDetectAndPreview = {
 thrSlider.addChangeListener({ e ->
   cfg1.thr = fromSlider(thrSlider.getValue())
   thrLabel.setText(String.format("Well threshold: %.2f", cfg1.thr))
+  // Recompute while dragging (throttled), and once more on release
   doDetectAndPreview()
+  if (!((JSlider)e.getSource()).getValueIsAdjusting()) doDetectAndPreview()
 } as ChangeListener)
 
 thrLabel.setText(String.format("Well threshold: %.2f", cfg1.thr))
@@ -581,6 +627,14 @@ cancel1.addActionListener({ e -> cfg1.accepted = false; d1.dispose() } as java.a
 d1.setVisible(true)
 if (!cfg1.accepted){ imp.setOverlay(null); return }
 if (wellRois.isEmpty()){ IJ.error("No wells detected at this threshold. Try a different value."); imp.setOverlay(null); return }
+
+// ===== Accurate recompute once (best-fit circles) =====
+FloatProcessor srcFP_final = cfg1.useMedian ? fpDenoised : fpRaw
+List<Roi> rawRois = detectAutoPolarityAccurate(srcFP_final, cfg1.thr)
+List<Roi> circlesFinal = new ArrayList<>()
+for (Roi r : rawRois) circlesFinal.add(bestFitCircleRoi(r, W, H))
+wellRois = circlesFinal
+overlayCirclesWithNumbers(imp, wellRois, Color.red, Color.white, labelFont)
 
 // ===== Build mask & wells-only cropped image =====
 int[] labelMap = labelMapFromRois(wellRois, W, H)
@@ -703,12 +757,12 @@ def refreshPreview = { ->
 }
 refreshPreview()
 
-// throttled slider updates
+// throttled slider updates (and ensure we redraw on release)
 long last2 = 0L
-final long MIN2 = 50L
+final long MIN2 = 60L
 thr2Slider.addChangeListener({ e ->
   long now = System.currentTimeMillis()
-  if (now - last2 < MIN2) return
+  if (now - last2 < MIN2 && ((JSlider)e.getSource()).getValueIsAdjusting()) return
   last2 = now
   cfg2.thr = fromSlider2(thr2Slider.getValue())
   thr2Label.setText(String.format("Content threshold: %.2f", cfg2.thr))
